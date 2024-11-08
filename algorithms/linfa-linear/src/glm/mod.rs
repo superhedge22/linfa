@@ -6,10 +6,7 @@ mod link;
 
 use crate::error::{LinearError, Result};
 use crate::float::Float;
-use argmin_math::{
-    ArgminAdd, ArgminDot, ArgminL1Norm, ArgminL2Norm, ArgminMinMax, ArgminMul, ArgminSignum,
-    ArgminSub, ArgminZero,
-};
+use argmin_math::{ArgminAdd, ArgminDot, ArgminL1Norm, ArgminL2Norm, ArgminMinMax, ArgminMul, ArgminSignum, ArgminSub, ArgminZero, ArgminZeroLike};
 use distribution::TweedieDistribution;
 pub use hyperparams::TweedieRegressorParams;
 pub use hyperparams::TweedieRegressorValidParams;
@@ -28,47 +25,39 @@ use linfa::traits::*;
 use linfa::DatasetBase;
 
 impl<F: Float, D: Data<Elem = F>, T: AsSingleTargets<Elem = F>>
-    Fit<ArrayBase<D, Ix2>, T, LinearError<F>> for TweedieRegressorValidParams<F>
+Fit<ArrayBase<D, Ix2>, T, LinearError<F>> for TweedieRegressorValidParams<F>
 where
-    Array1<F>: ArgminAdd<Array1<F>, Array1<F>>
-        + ArgminSub<Array1<F>, Array1<F>>
-        + ArgminSub<F, Array1<F>>
-        + ArgminAdd<F, Array1<F>>
-        + ArgminMul<F, Array1<F>>
-        + ArgminMul<Array1<F>, Array1<F>>
-        + ArgminDot<Array1<F>, F>
-        + ArgminL2Norm<F>
-        + ArgminL1Norm<F>
-        + ArgminSignum
-        + ArgminMinMax,
-    F: ArgminMul<Array1<F>, Array1<F>> + ArgminZero,
+    Vec<F>: ArgminAdd<Vec<F>, Vec<F>>
+    + ArgminSub<Vec<F>, Vec<F>>
+    + ArgminSub<F, Vec<F>>
+    + ArgminAdd<F, Vec<F>>
+    + ArgminMul<F, Vec<F>>
+    + ArgminMul<Vec<F>, Vec<F>>
+    + ArgminDot<Vec<F>, F>
+    + ArgminL2Norm<F>
+    + ArgminL1Norm<F>
+    + ArgminSignum
+    + ArgminMinMax
+    + ArgminZeroLike,
+    F: ArgminMul<Vec<F>, Vec<F>> + ArgminZero,
 {
     type Object = TweedieRegressor<F>;
 
     fn fit(&self, ds: &DatasetBase<ArrayBase<D, Ix2>, T>) -> Result<Self::Object, F> {
         let (x, y) = (ds.records(), ds.as_single_targets());
-
         let dist = TweedieDistribution::new(self.power())?;
         let link = self.link();
 
-        // If link is not set we automatically select an appropriate
-        // link function
-
         if !dist.in_range(&y) {
-            // An error is sent when y has values in the range not applicable
-            // for the distribution
             return Err(LinearError::InvalidTargetRange(self.power()));
         }
-        // We initialize the coefficients and intercept
+
         let mut coef = Array::zeros(x.ncols());
         if self.fit_intercept() {
             let temp = link.link(&array![y.mean().unwrap()]);
             coef = concatenate!(Axis(0), temp, coef);
         }
 
-        // Constructing a struct that satisfies the requirements of the L-BFGS solver
-        // with functions implemented for the objective function and the parameter
-        // gradient
         let problem = TweedieProblem {
             x: x.view(),
             y,
@@ -78,17 +67,13 @@ where
             alpha: self.alpha(),
         };
         let linesearch = MoreThuenteLineSearch::new();
-
-        // L-BFGS maintains a history of the past m updates of the
-        // position x and gradient ∇f(x), where generally the history
-        // size m can be small (often m < 10)
-        // For our problem we set m as 7
         let solver = LBFGS::new(linesearch, 7).with_tolerance_grad(F::cast(self.tol()))?;
 
         let mut result = Executor::new(problem, solver)
-            .configure(|state| state.param(coef).max_iters(self.max_iter() as u64))
+            .configure(|state| state.param(coef.to_vec()).max_iters(self.max_iter() as u64))
             .run()?;
-        coef = result.state.take_best_param().unwrap();
+
+        let coef = Array1::from_vec(result.state.take_best_param().unwrap());
 
         if self.fit_intercept() {
             Ok(TweedieRegressor {
@@ -115,54 +100,57 @@ struct TweedieProblem<'a, F: Float> {
     alpha: F,
 }
 
-impl<'a, A: Float> TweedieProblem<'a, A> {
-    fn ypred(&self, p: &Array1<A>) -> (Array1<A>, Array1<A>, usize) {
+impl<'a, F: Float> TweedieProblem<'a, F> {
+    fn to_array(&self, p: &[F]) -> Array1<F> {
+        Array1::from_vec(p.to_vec())
+    }
+
+    fn to_vec(&self, arr: Array1<F>) -> Vec<F> {
+        arr.to_vec()
+    }
+
+    fn ypred(&self, p: &[F]) -> (Array1<F>, Array1<F>, usize) {
+        let p_arr = self.to_array(p);
         let mut offset = 0;
-        let mut intercept = A::from(0.).unwrap();
+        let mut intercept = F::zero();
         if self.fit_intercept {
             offset = 1;
-            intercept = *p.get(0).unwrap();
+            intercept = *p_arr.get(0).unwrap();
         }
 
         let lin_pred = self
             .x
             .view()
-            .dot(&p.slice(s![offset..]))
+            .dot(&p_arr.slice(s![offset..]))
             .mapv(|x| x + intercept);
 
         (self.link.inverse(&lin_pred), lin_pred, offset)
     }
 }
 
-impl<'a, A: Float> CostFunction for TweedieProblem<'a, A> {
-    type Param = Array1<A>;
-    type Output = A;
+impl<'a, F: Float> CostFunction for TweedieProblem<'a, F> {
+    type Param = Vec<F>;
+    type Output = F;
 
-    // This function calculates the value of the objective function we are trying
-    // to minimize,
-    //
-    // 0.5 * (deviance(y, ypred) + alpha * |p|_2)
-    //
-    // - `p` is the parameter we are optimizing (coefficients and intercept)
-    // - `alpha` is the regularization hyperparameter
     fn cost(&self, p: &Self::Param) -> std::result::Result<Self::Output, argmin::core::Error> {
         let (ypred, _, offset) = self.ypred(p);
 
         let dev = self.dist.deviance(self.y, ypred.view())?;
 
-        let pscaled = p
+        let p_arr = self.to_array(p);
+        let pscaled = p_arr
             .slice(s![offset..])
-            .mapv(|x| x * A::from(self.alpha).unwrap());
+            .mapv(|x| x * self.alpha);
 
-        let obj = A::from(0.5).unwrap() * (dev + p.slice(s![offset..]).dot(&pscaled));
+        let obj = F::cast(0.5) * (dev + p_arr.slice(s![offset..]).dot(&pscaled));
 
         Ok(obj)
     }
 }
 
-impl<'a, A: Float> Gradient for TweedieProblem<'a, A> {
-    type Param = Array1<A>;
-    type Gradient = Array1<A>;
+impl<'a, F: Float> Gradient for TweedieProblem<'a, F> {
+    type Param = Vec<F>;
+    type Gradient = Vec<F>;
 
     fn gradient(&self, p: &Self::Param) -> std::result::Result<Self::Param, argmin::core::Error> {
         let (ypred, lin_pred, offset) = self.ypred(p);
@@ -176,15 +164,16 @@ impl<'a, A: Float> Gradient for TweedieProblem<'a, A> {
             devp = temp.dot(&self.x);
         }
 
-        let pscaled = p
+        let p_arr = self.to_array(p);
+        let pscaled = p_arr
             .slice(s![offset..])
-            .mapv(|x| x * A::from(self.alpha).unwrap());
+            .mapv(|x| x * self.alpha);
 
-        let mut objp = devp.mapv(|x| x * A::from(0.5).unwrap());
+        let mut objp = devp.mapv(|x| x * F::cast(0.5));
         objp.slice_mut(s![offset..])
             .zip_mut_with(&pscaled, |x, y| *x += *y);
 
-        Ok(objp)
+        Ok(self.to_vec(objp))
     }
 }
 

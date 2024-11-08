@@ -9,9 +9,11 @@ use std::hash::Hash;
 use crate::base_nb::{filter, NaiveBayes, NaiveBayesValidParams};
 use crate::error::{NaiveBayesError, Result};
 use crate::hyperparams::{GaussianNbParams, GaussianNbValidParams};
+use ndarray_stats::{ SummaryStatisticsExt};
 
 #[cfg(feature = "serde")]
 use serde_crate::{Deserialize, Serialize};
+
 
 impl<'a, F, L, D, T> NaiveBayesValidParams<'a, F, L, D, T> for GaussianNbValidParams<F, L>
 where
@@ -31,7 +33,6 @@ where
 {
     type Object = GaussianNb<F, L>;
 
-    // Thin wrapper around the corresponding method of NaiveBayesValidParams
     fn fit(&self, dataset: &DatasetBase<ArrayBase<D, Ix2>, T>) -> Result<Self::Object> {
         let model = NaiveBayesValidParams::fit(self, dataset, None)?;
         Ok(model.unwrap())
@@ -39,7 +40,7 @@ where
 }
 
 impl<'a, F, L, D, T> FitWith<'a, ArrayBase<D, Ix2>, T, NaiveBayesError>
-    for GaussianNbValidParams<F, L>
+for GaussianNbValidParams<F, L>
 where
     F: Float,
     L: Label + 'a,
@@ -57,10 +58,15 @@ where
         let x = dataset.records();
         let y = dataset.as_single_targets();
 
-        // If the ratio of the variance between dimensions is too small, it will cause
-        // numerical errors. We address this by artificially boosting the variance
-        // by `epsilon` (a small fraction of the variance of the largest feature)
-        let epsilon = self.var_smoothing() * *x.var_axis(Axis(0), F::zero()).max()?;
+        // Calculate variance along axis 0 and find its maximum value
+        let var_axis = x.var_axis(Axis(0), F::zero());
+        let max_var = var_axis.iter()
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .copied()
+            .unwrap_or_else(|| F::zero());
+
+        // Calculate epsilon using the maximum variance
+        let epsilon = self.var_smoothing() * max_var;
 
         let mut model = match model_in {
             Some(mut temp) => {
@@ -77,13 +83,9 @@ where
         let yunique = dataset.labels();
 
         for class in yunique {
-            // We filter for records that correspond to the current class
             let xclass = filter(x.view(), y.view(), &class);
-
-            // We count the number of occurences of the class
             let nclass = xclass.nrows();
 
-            // We compute the update of the gaussian mean and variance
             let class_info = model
                 .class_info
                 .entry(class)
@@ -91,20 +93,16 @@ where
 
             let (theta_new, sigma_new) = Self::update_mean_variance(class_info, xclass.view());
 
-            // We now update the mean, variance and class count
             class_info.theta = theta_new;
             class_info.sigma = sigma_new;
             class_info.class_count += nclass;
         }
 
-        // We add back the epsilon previously subtracted for numerical
-        // calculation stability
         model
             .class_info
             .values_mut()
             .for_each(|x| x.sigma += epsilon);
 
-        // We update the priors
         let class_count_sum = model
             .class_info
             .values()
@@ -123,7 +121,6 @@ impl<F: Float, L: Label, D> PredictInplace<ArrayBase<D, Ix2>, Array1<L>> for Gau
 where
     D: Data<Elem = F>,
 {
-    // Thin wrapper around the corresponding method of NaiveBayes
     fn predict_inplace(&self, x: &ArrayBase<D, Ix2>, y: &mut Array1<L>) {
         NaiveBayes::predict_inplace(self, x, y);
     }
@@ -137,42 +134,31 @@ impl<'a, F, L> GaussianNbValidParams<F, L>
 where
     F: Float,
 {
-    // Compute online update of gaussian mean and variance
     fn update_mean_variance(
         info_old: &GaussianClassInfo<F>,
         x_new: ArrayView2<F>,
     ) -> (Array1<F>, Array1<F>) {
-        // Deconstruct old state
         let (count_old, mu_old, var_old) = (info_old.class_count, &info_old.theta, &info_old.sigma);
 
-        // If incoming data is empty no updates required
         if x_new.nrows() == 0 {
             return (mu_old.to_owned(), var_old.to_owned());
         }
 
         let count_new = x_new.nrows();
 
-        // unwrap is safe because None is returned only when number of records
-        // along the specified axis is 0, we return early if we have 0 rows
         let mu_new = x_new.mean_axis(Axis(0)).unwrap();
         let var_new = x_new.var_axis(Axis(0), F::zero());
 
-        // If previous batch was empty, we send the new mean and variance calculated
         if count_old == 0 {
             return (mu_new, var_new);
         }
 
         let count_total = count_old + count_new;
 
-        // Combine old and new mean, taking into consideration the number
-        // of observations
         let mu_new_weighted = &mu_new * F::cast(count_new);
         let mu_old_weighted = mu_old * F::cast(count_old);
         let mu_weighted = (mu_new_weighted + mu_old_weighted).mapv(|x| x / F::cast(count_total));
 
-        // Combine old and new variance, taking into consideration the number
-        // of observations. This is achieved by combining the sum of squared
-        // differences
         let ssd_old = var_old * F::cast(count_old);
         let ssd_new = var_new * F::cast(count_new);
         let weight = F::cast(count_new * count_old) / F::cast(count_total);
